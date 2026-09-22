@@ -62,6 +62,9 @@ SPIKE_W = 55                  # sustained discharge rate worth flagging (W)
 APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, "frozen", False) else __file__))
 LOG_DIR = os.path.join(APP_DIR, "logs")
 REPORT_DIR = os.path.join(APP_DIR, "reports")
+CFG_PATH = os.path.join(APP_DIR, "voltcheck.ini")
+YT_DEFAULT = ("https://www.youtube.com/results?search_query="
+              "norwegian+train+cab+view+livestream")
 
 
 # ---------------------------------------------------------------- ctypes data
@@ -606,6 +609,7 @@ class App(ctk.CTk):
         self._saved_power: dict = {}
         self._ui_queue: queue.Queue = queue.Queue()  # threads -> main thread
         self.sim = LoadSim()
+        self._yt_url = self._load_cfg()
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -695,6 +699,12 @@ class App(ctk.CTk):
             hover_color="#274427", text_color=TEAL,
             font=("Segoe UI", 12, "bold"), command=self._toggle_sim)
         self.sim_btn.pack(fill="x", pady=3)
+        self.yt_btn = ctk.CTkButton(
+            btn, text="📺  YT VIDEO TEST", fg_color="#1a2b1a",
+            hover_color="#274427", text_color=TEAL,
+            font=("Segoe UI", 12, "bold"), command=self._yt_test)
+        self.yt_btn.pack(fill="x", pady=3)
+        self.yt_btn.bind("<Button-3>", lambda e: self._yt_url_prompt())
         ctk.CTkButton(btn, text="📄  GENERATE REPORT", fg_color="#1a2b1a",
                       hover_color="#274427", text_color=TEAL,
                       font=("Segoe UI", 12, "bold"),
@@ -1109,6 +1119,56 @@ class App(ctk.CTk):
             self.sim_btn.configure(text="👤  USER SIM: ON", text_color=GREEN)
             self._log("ok", "User simulation running — wandering CPU load "
                            "(~25-50%, bursts & pauses)")
+
+    # -- YouTube video load test ------------------------------------------
+
+    def _load_cfg(self) -> str:
+        try:
+            for line in open(CFG_PATH, encoding="utf-8"):
+                if line.startswith("yt_url="):
+                    return line.split("=", 1)[1].strip()
+        except OSError:
+            pass
+        return ""
+
+    def _save_cfg(self, url: str):
+        try:
+            with open(CFG_PATH, "w", encoding="utf-8") as f:
+                f.write(f"yt_url={url}\n")
+        except OSError:
+            pass
+
+    def _yt_url_prompt(self):
+        d = ctk.CTkInputDialog(text="YouTube URL for the video test\n"
+                                  "(a long stream works best - it never ends):",
+                               title="Video test URL")
+        url = d.get_input()
+        if url and url.strip():
+            self._yt_url = url.strip()
+            self._save_cfg(self._yt_url)
+            self._log("ok", f"Video test URL saved: {self._yt_url}")
+
+    def _yt_test(self):
+        if not self._yt_url:
+            self._yt_url_prompt()
+            if not self._yt_url:
+                self._yt_url = YT_DEFAULT
+        url = self._yt_url
+        # Edge flag forces autoplay-with-audio; falls back to default browser
+        edge = next((p for p in (
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe")
+            if os.path.exists(p)), None)
+        try:
+            if edge:
+                subprocess.Popen(
+                    [edge, "--autoplay-policy=no-user-gesture-required",
+                     "--start-maximized", url])
+            else:
+                webbrowser.open(url)
+            self._log("ok", "Video test launched — leave it playing for the drain run")
+        except Exception as e:
+            self._log("fault", f"Could not open browser: {e}")
 
     def _on_close(self):
         self.sim.stop()
