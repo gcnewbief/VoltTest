@@ -13,6 +13,7 @@ dist_new/
 logs/
 reports/
 *.csv
+voltcheck.ini
 
 # secrets
 .env
