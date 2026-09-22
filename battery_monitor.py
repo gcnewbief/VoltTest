@@ -37,6 +37,7 @@ from matplotlib.figure import Figure
 # ---------------------------------------------------------------- constants
 
 APP_NAME = "VoltCheck"
+APP_VERSION = "1.0.0"
 SAMPLE_MS = 2000               # poll interval
 GRAPH_MAX_POINTS = 5400        # ~3h of data at 2s
 
@@ -548,7 +549,7 @@ th{{background:{PANEL};color:{TEAL}}} td{{background:{PANEL_ALT}}}
 background:{PANEL};border:1px solid {BORDER};margin:20px 0}}
 </style></head><body>
 <h1>VoltCheck Battery Report{' <span style="color:#ffab40;font-size:14px">[DEMO DATA]</span>' if demo else ''}</h1>
-<div class="meta">Generated {now:%Y-%m-%d %H:%M:%S}</div>
+<div class="meta">Generated {now:%Y-%m-%d %H:%M:%S} · VoltCheck v{APP_VERSION}</div>
 <div class="verdict" style="color:{v_color}">VERDICT: {html.escape(verdict)}</div>
 <h2>Battery{' (aggregate — ' + str(len(st.batteries)) + ' installed)' if len(st.batteries) > 1 else ''}</h2><div class="cards">
 {card("Name", st.name or "-")}{card("Manufacturer", st.manufacturer or "-")}
@@ -587,7 +588,7 @@ def fmt_dur(secs: float) -> str:
 class App(ctk.CTk):
     def __init__(self, demo: bool = False):
         super().__init__()
-        self.title(APP_NAME)
+        self.title(f"{APP_NAME} v{APP_VERSION}")
         ctk.set_appearance_mode("dark")
         self.configure(fg_color=BG)
         self.update_idletasks()
@@ -629,7 +630,7 @@ class App(ctk.CTk):
         top = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=44)
         top.grid(row=0, column=0, columnspan=2, sticky="ew")
         top.grid_propagate(False)
-        ctk.CTkLabel(top, text="⚡ VOLTCHECK", text_color=GREEN,
+        ctk.CTkLabel(top, text=f"⚡ VOLTCHECK  v{APP_VERSION}", text_color=GREEN,
                      font=("Consolas", 20, "bold")).pack(side="left", padx=16)
         self.rec_lbl = ctk.CTkLabel(top, text="● IDLE", text_color=TEXT_DIM,
                                     font=("Consolas", 14, "bold"))
