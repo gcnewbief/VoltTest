@@ -6,6 +6,7 @@ __pycache__/
 # pyinstaller
 build/
 dist/
+dist_new/
 *.spec.bak
 
 # app output
