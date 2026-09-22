@@ -33,7 +33,7 @@ subprocess.run([GIT, "remote", "add", "origin",
 
 r = subprocess.run(
     [GIT, "-c", f"http.extraHeader=Authorization: Basic {auth}",
-     "push", "-u", "origin", "main"],
+     "push", "-u", "origin", "main", "--tags"],
     cwd=HERE, capture_output=True, text=True)
 print(r.stdout)
 print(r.stderr.replace(token, "***"))
