@@ -46,6 +46,7 @@ BORDER    = "#1d2b1d"
 GREEN     = "#00e676"
 GREEN_DIM = "#1b5e20"
 TEAL      = "#69f0ae"
+BLUE      = "#40c4ff"
 TEXT      = "#d9ffe4"
 TEXT_DIM  = "#6f8f76"
 ORANGE    = "#ffab40"
@@ -416,9 +417,9 @@ def _svg_chart(samples: list[Sample], w=920, h=260) -> str:
     pts = " ".join(f"{x(s.ts):.1f},{yp(s.percent):.1f}" for s in samples)
     parts.append(f'<polyline points="{pts}" fill="none" stroke="{GREEN}" stroke-width="1.8"/>')
     rpts = " ".join(f"{x(s.ts):.1f},{yr(abs(s.rate_mw)):.1f}" for s in samples)
-    parts.append(f'<polyline points="{rpts}" fill="none" stroke="{TEAL}" '
-                 f'stroke-width="1" opacity="0.55"/>')
-    parts.append(f'<text x="{w-pad_r+6}" y="{pad_t+10}" fill="{TEAL}" '
+    parts.append(f'<polyline points="{rpts}" fill="none" stroke="{BLUE}" '
+                 f'stroke-width="1" opacity="0.6"/>')
+    parts.append(f'<text x="{w-pad_r+6}" y="{pad_t+10}" fill="{BLUE}" '
                  f'font-size="10">{rmax//1000}W</text>')
     parts.append('</svg>')
     return "".join(parts)
@@ -599,7 +600,7 @@ class App(ctk.CTk):
 
         self.pct_lbl = self._mk_label(inner, "–%", ("Consolas", 44, "bold"), GREEN, pady=(10, 0))
         self.state_lbl = self._mk_label(inner, "Detecting…", ("Segoe UI", 14), TEXT_DIM)
-        self.rate_lbl = self._mk_label(inner, "", ("Consolas", 16, "bold"), TEAL, pady=(4, 0))
+        self.rate_lbl = self._mk_label(inner, "", ("Consolas", 16, "bold"), BLUE, pady=(4, 0))
         self.eta_lbl = self._mk_label(inner, "", ("Segoe UI", 12), TEXT_DIM, pady=(0, 8))
 
         self._sep(inner)
@@ -658,12 +659,12 @@ class App(ctk.CTk):
             a.tick_params(colors=TEXT_DIM, labelsize=8)
         self.ax.set_ylim(0, 100)
         self.ax.set_ylabel("Charge %", color=GREEN, fontsize=9)
-        self.ax2.set_ylabel("Power W", color=TEAL, fontsize=9)
+        self.ax2.set_ylabel("Power W", color=BLUE, fontsize=9)
         self.ax.grid(True, color=GRID, linewidth=0.6)
         self.ax.set_title("Charge / discharge", color=TEXT_DIM, fontsize=10, loc="left")
         self.fig.tight_layout(pad=1.2)
         (self.line_pct,) = self.ax.plot([], [], color=GREEN, lw=1.6)
-        (self.line_rate,) = self.ax2.plot([], [], color=TEAL, lw=0.9, alpha=0.55)
+        (self.line_rate,) = self.ax2.plot([], [], color=BLUE, lw=0.9, alpha=0.65)
         self.anom_scatter = self.ax.scatter([], [], color=RED, s=18, zorder=5)
         self.canvas = FigureCanvasTkAgg(self.fig, master=graphf)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
