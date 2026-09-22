@@ -1,0 +1,24 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# pyinstaller
+build/
+dist/
+*.spec.bak
+
+# app output
+logs/
+reports/
+*.csv
+
+# secrets
+.env
+
+# dev artifacts
+mingit.zip
+ui_*.png
+crop_*.png
+battrep.html
+probe.ps1
