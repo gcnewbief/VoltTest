@@ -11,6 +11,7 @@ Demo       : simulated drain for machines without a battery (python battery_moni
 
 import ctypes
 import csv
+import hashlib
 import html
 import json
 import math
@@ -324,6 +325,59 @@ class DemoBattery:
                            est_secs=int(self.remaining / (-rate) * 3600))
 
 
+# ---------------------------------------------------------------- user sim
+
+class LoadSim:
+    """Human-ish CPU load: PBKDF2 runs in OpenSSL (outside the GIL) so one
+    thread per core gives real multi-core load. Duty cycle wanders like a
+    person working - bursts, pauses, light periods."""
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self.target = 0.35
+        self._threads: list[threading.Thread] = []
+        self.active = False
+
+    def start(self):
+        self._stop.clear()
+        self.active = True
+        n = os.cpu_count() or 4
+        for _ in range(n):
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            self._threads.append(t)
+        threading.Thread(target=self._wander, daemon=True).start()
+
+    def stop(self):
+        self.active = False
+        self._stop.set()
+        self._threads.clear()
+
+    def _worker(self):
+        salt = os.urandom(16)
+        while not self._stop.is_set():
+            t0 = time.perf_counter()
+            budget = self.target * 0.1            # busy secs per 100ms window
+            while time.perf_counter() - t0 < budget:
+                hashlib.pbkdf2_hmac("sha256", b"voltcheck", salt, 4000)
+            time.sleep(max(0.001, 0.1 - (time.perf_counter() - t0)))
+
+    def _wander(self):
+        rng = random.Random()
+        while not self._stop.is_set():
+            roll = rng.random()
+            if roll < 0.12:                       # burst: "opened an app"
+                self.target = rng.uniform(0.6, 0.85)
+                dwell = rng.uniform(2, 5)
+            elif roll < 0.25:                     # pause: "reading / typing"
+                self.target = rng.uniform(0.03, 0.08)
+                dwell = rng.uniform(2, 6)
+            else:                                 # normal work
+                self.target = rng.uniform(0.3, 0.55)
+                dwell = rng.uniform(5, 14)
+            self._stop.wait(dwell)
+
+
 # ---------------------------------------------------------------- recording
 
 @dataclass
@@ -551,6 +605,7 @@ class App(ctk.CTk):
         self._drain_unlocked = False
         self._saved_power: dict = {}
         self._ui_queue: queue.Queue = queue.Queue()  # threads -> main thread
+        self.sim = LoadSim()
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -635,6 +690,11 @@ class App(ctk.CTk):
             hover_color="#274427", text_color=ORANGE,
             font=("Segoe UI", 12, "bold"), command=self._toggle_drain)
         self.drain_btn.pack(fill="x", pady=3)
+        self.sim_btn = ctk.CTkButton(
+            btn, text="👤  USER SIM: OFF", fg_color="#1a2b1a",
+            hover_color="#274427", text_color=TEAL,
+            font=("Segoe UI", 12, "bold"), command=self._toggle_sim)
+        self.sim_btn.pack(fill="x", pady=3)
         ctk.CTkButton(btn, text="📄  GENERATE REPORT", fg_color="#1a2b1a",
                       hover_color="#274427", text_color=TEAL,
                       font=("Segoe UI", 12, "bold"),
@@ -1039,7 +1099,19 @@ class App(ctk.CTk):
             self._log("fault", "Could not change power settings — run VoltCheck "
                                "as Administrator to unlock deep drain")
 
+    def _toggle_sim(self):
+        if self.sim.active:
+            self.sim.stop()
+            self.sim_btn.configure(text="👤  USER SIM: OFF", text_color=TEAL)
+            self._log("info", "User simulation stopped")
+        else:
+            self.sim.start()
+            self.sim_btn.configure(text="👤  USER SIM: ON", text_color=GREEN)
+            self._log("ok", "User simulation running — wandering CPU load "
+                           "(~25-50%, bursts & pauses)")
+
     def _on_close(self):
+        self.sim.stop()
         if self._drain_unlocked:
             self._toggle_drain()          # restore power settings on exit
         self.destroy()
