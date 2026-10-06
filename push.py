@@ -1,9 +1,12 @@
 import base64
 import os
+import shutil
 import subprocess
 import sys
 
-GIT = r"C:\Users\GCTesting\Devin working\tools\mingit\cmd\git.exe"
+# prefer git on PATH; fall back to a bundled mingit if one exists
+_FALLBACK_GIT = r"C:\Users\GCTesting\Devin working\tools\mingit\cmd\git.exe"
+GIT = shutil.which("git") or _FALLBACK_GIT
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 env = {}

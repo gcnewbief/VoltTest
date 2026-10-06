@@ -26,6 +26,7 @@ import time
 import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
+from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 import matplotlib
@@ -59,6 +60,8 @@ HEALTH_GOOD = 90.0
 HEALTH_WORN = 60.0
 DROP_FAULT_PCT = 3            # % drop per sample that suggests a dead cell
 SPIKE_W = 55                  # sustained discharge rate worth flagging (W)
+LOW_BATT_PCT = 10             # below this, % drops are normal — no dead-cell
+                            # faults; during a test the report auto-saves here
 
 APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, "frozen", False) else __file__))
 LOG_DIR = os.path.join(APP_DIR, "logs")
@@ -412,10 +415,13 @@ class Recorder:
         self._csv_writer = None
         self.start_ts = 0.0
 
-    def start(self):
+    def start(self, carry: bool = False):
+        """Start a new CSV. carry=True keeps the current samples/events (a
+        loaded log being continued) and writes them into the new file."""
         os.makedirs(LOG_DIR, exist_ok=True)
-        self.samples.clear()
-        self.events.clear()
+        if not carry:
+            self.samples.clear()
+            self.events.clear()
         self.recording = True
         self.start_ts = time.time()
         self.csv_path = os.path.join(
@@ -425,6 +431,8 @@ class Recorder:
         self._csv_writer.writerow(
             ["timestamp", "iso_time", "percent", "remaining_mwh",
              "rate_mw", "voltage_mv", "plugged", "charging"])
+        for s in self.samples:
+            self._write_row(s)
 
     def stop(self):
         self.recording = False
@@ -433,14 +441,17 @@ class Recorder:
             self._csv_file.close()
             self._csv_file = None
 
+    def _write_row(self, s: Sample):
+        self._csv_writer.writerow(
+            [f"{s.ts:.3f}", datetime.fromtimestamp(s.ts).isoformat(timespec="seconds"),
+             s.percent, s.remaining_mwh, s.rate_mw, s.voltage_mv,
+             int(s.plugged), int(s.charging)])
+        self._csv_file.flush()
+
     def add(self, s: Sample):
         self.samples.append(s)
         if self._csv_writer:
-            self._csv_writer.writerow(
-                [f"{s.ts:.3f}", datetime.fromtimestamp(s.ts).isoformat(timespec="seconds"),
-                 s.percent, s.remaining_mwh, s.rate_mw, s.voltage_mv,
-                 int(s.plugged), int(s.charging)])
-            self._csv_file.flush()
+            self._write_row(s)
 
 
 # ---------------------------------------------------------------- report
@@ -598,6 +609,10 @@ class App(ctk.CTk):
 
         self.demo = demo
         self.rec = Recorder()
+        self.live_samples: list[Sample] = []          # rolling buffer, always live
+        self._view_samples = self.live_samples        # what the graph shows
+        self._loaded_csv = ""                         # log open for review/continue
+        self._auto_reported = False                   # low-% report already saved
         self.demo_batt = DemoBattery() if demo else None
         self.static = StaticInfo()
         self.last_sample: Sample | None = None
@@ -706,7 +721,11 @@ class App(ctk.CTk):
             font=("Segoe UI", 12, "bold"), command=self._yt_test)
         self.yt_btn.pack(fill="x", pady=3)
         self.yt_btn.bind("<Button-3>", lambda e: self._yt_url_prompt())
-        ctk.CTkButton(btn, text="📄  GENERATE REPORT", fg_color="#1a2b1a",
+        ctk.CTkButton(btn, text="�  OPEN LOG", fg_color="#1a2b1a",
+                      hover_color="#274427", text_color=TEAL,
+                      font=("Segoe UI", 12, "bold"),
+                      command=self._open_log).pack(fill="x", pady=3)
+        ctk.CTkButton(btn, text="�📄  GENERATE REPORT", fg_color="#1a2b1a",
                       hover_color="#274427", text_color=TEAL,
                       font=("Segoe UI", 12, "bold"),
                       command=self._gen_report).pack(fill="x", pady=3)
@@ -774,12 +793,12 @@ class App(ctk.CTk):
 
     # ---------------- logging / events
 
-    def _log(self, level: str, text: str):
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.rec.events.append(Event(time.time(), level, text))
+    def _log(self, level: str, text: str, ts: float | None = None):
+        t = datetime.fromtimestamp(ts) if ts else datetime.now()
+        self.rec.events.append(Event(ts or time.time(), level, text))
         self.log_box.configure(state="normal")
         inner = self.log_box._textbox
-        inner.insert("end", f"[{ts}] ", "info")
+        inner.insert("end", f"[{t.strftime('%H:%M:%S')}] ", "info")
         inner.insert("end", text + "\n", level)
         inner.see("end")
         self.log_box.configure(state="disabled")
@@ -918,7 +937,19 @@ class App(ctk.CTk):
         if s.rate_mw == 0:
             s.rate_mw = self._derive_rate(s)   # firmware gave no rate -> measure it
         self._analyze(s)
-        self.rec.add(s)          # always buffer for the live graph
+        self.live_samples.append(s)
+        if len(self.live_samples) > GRAPH_MAX_POINTS:
+            del self.live_samples[:len(self.live_samples) - GRAPH_MAX_POINTS]
+        if self.rec.recording:
+            self.rec.add(s)
+            # battery is nearly dead - save a report now, the machine may
+            # cut power before the test is stopped manually
+            if (not self._auto_reported and not s.plugged
+                    and 0 <= s.percent <= LOW_BATT_PCT):
+                self._auto_reported = True
+                self._log("warn", f"Battery at {s.percent}% — auto-saving report "
+                                  "before shutdown")
+                self._gen_report(open_browser=False)
         self.last_sample = s
         self._refresh_stats(r, s)
         self._refresh_graph()
@@ -927,7 +958,7 @@ class App(ctk.CTk):
     def _derive_rate(self, s: Sample) -> int:
         """Estimate charge rate in mW from capacity deltas over ~15s window.
         Sign convention matches firmware: + charging, - discharging."""
-        for old in reversed(self.rec.samples[-40:]):
+        for old in reversed(self.live_samples[-40:]):
             if s.ts - old.ts >= 15 and old.remaining_mwh and s.remaining_mwh:
                 return int((s.remaining_mwh - old.remaining_mwh)
                            * 3600 / (s.ts - old.ts))
@@ -937,23 +968,29 @@ class App(ctk.CTk):
         prev = self.last_sample
         if prev:
             drop = prev.percent - s.percent
-            if s.percent >= 0 and prev.percent >= 0 and not s.plugged and drop >= DROP_FAULT_PCT:
+            # drops below LOW_BATT_PCT are normal - cells fall off a cliff
+            # near empty; only flag mid-range drops as dead-cell suspects
+            if (s.percent >= 0 and prev.percent >= 0 and not s.plugged
+                    and s.percent > LOW_BATT_PCT and drop >= DROP_FAULT_PCT):
                 self._log("fault", f"SUDDEN DROP {prev.percent}%→{s.percent}% "
-                                   f"— possible dead cell / gauge fault")
+                                   f"— possible dead cell / gauge fault", ts=s.ts)
             if s.plugged != prev.plugged:
-                self._log("info", "AC adapter " + ("connected" if s.plugged else "removed"))
+                self._log("info", "AC adapter " + ("connected" if s.plugged else "removed"),
+                          ts=s.ts)
         if s.charging:
             if self.charge_stall_since == 0:
                 self.charge_stall_since = s.ts
                 self._stall_base = s.percent
             elif s.ts - self.charge_stall_since > 300 and s.percent <= getattr(self, "_stall_base", 0):
-                self._log("fault", "Charging for 5+ min with no % gain — charge circuit fault?")
+                self._log("fault", "Charging for 5+ min with no % gain — charge circuit fault?",
+                          ts=s.ts)
                 self.charge_stall_since = s.ts
                 self._stall_base = s.percent
         else:
             self.charge_stall_since = 0
         if s.rate_mw <= -SPIKE_W * 1000 and (not prev or prev.rate_mw > -SPIKE_W * 1000):
-            self._log("warn", f"High discharge rate {-s.rate_mw/1000:.0f} W — heavy load")
+            self._log("warn", f"High discharge rate {-s.rate_mw/1000:.0f} W — heavy load",
+                      ts=s.ts)
 
     def _refresh_stats(self, r: LiveReading, s: Sample):
         pct_txt = f"{s.percent}%" if s.percent >= 0 else "–%"
@@ -982,7 +1019,7 @@ class App(ctk.CTk):
             self.cap_fcc.configure(text=f"{fcc:,} mWh")
 
     def _refresh_graph(self):
-        samples = self.rec.samples
+        samples = self._view_samples
         if not samples:
             self.canvas.draw_idle()
             return
@@ -994,7 +1031,8 @@ class App(ctk.CTk):
         self.line_rate.set_data(x, [abs(s.rate_mw) / 1000 for s in ss])
         drops_x, drops_y = [], []  # mark samples right after a big drop
         for i in range(1, len(ss)):
-            if ss[i - 1].percent - ss[i].percent >= DROP_FAULT_PCT:
+            if (ss[i - 1].percent - ss[i].percent >= DROP_FAULT_PCT
+                    and ss[i].percent > LOW_BATT_PCT):
                 drops_x.append((ss[i].ts - t0) / 60)
                 drops_y.append(ss[i].percent)
         self.anom_scatter.set_offsets(list(zip(drops_x, drops_y)) if drops_x else [[0, -10]])
@@ -1016,7 +1054,18 @@ class App(ctk.CTk):
             self.cancel_btn.configure(state="disabled")
             self._summarize()
         else:
-            self.rec.start()
+            resume = bool(self._loaded_csv) and messagebox.askyesno(
+                "Continue test?", parent=self,
+                message=f"Continue from loaded log {os.path.basename(self._loaded_csv)}?\n\n"
+                        "Yes = new samples are appended onto the loaded data (a new "
+                        "combined CSV is written; the old log is untouched).\n"
+                        "No = start a fresh test.")
+            self.rec.start(carry=resume)
+            self._loaded_csv = ""
+            self._view_samples = self.rec.samples
+            self._auto_reported = False
+            self.ax.set_title("Drain test — live", color=TEXT_DIM,
+                              fontsize=10, loc="left")
             self.rec_lbl.configure(text="● REC", text_color=RED)
             self.test_btn.configure(text="■  STOP TEST", fg_color="#5d1a1a",
                                     hover_color="#7a2222")
@@ -1024,7 +1073,8 @@ class App(ctk.CTk):
             self.log_box.configure(state="normal")
             self.log_box._textbox.delete("1.0", "end")
             self.log_box.configure(state="disabled")
-            self._log("ok", f"Drain test started → {os.path.basename(self.rec.csv_path)}")
+            self._log("ok", f"Drain test {'resumed onto loaded log' if resume else 'started'}"
+                            f" → {os.path.basename(self.rec.csv_path)}")
             if self.last_sample and self.last_sample.plugged:
                 self._log("warn", "AC is connected — unplug to begin discharging")
 
@@ -1035,6 +1085,8 @@ class App(ctk.CTk):
         csv_path = self.rec.csv_path
         self.rec.stop()
         self.rec.samples.clear()
+        self._view_samples = self.live_samples
+        self.ax.set_title("Charge / discharge", color=TEXT_DIM, fontsize=10, loc="left")
         self.rec_lbl.configure(text="● IDLE", text_color=TEXT_DIM)
         self.test_btn.configure(text="▶  START DRAIN TEST", fg_color=GREEN_DIM)
         self.cancel_btn.configure(state="disabled")
@@ -1109,6 +1161,64 @@ class App(ctk.CTk):
         else:
             self._log("fault", "Could not change power settings — run VoltCheck "
                                "as Administrator to unlock deep drain")
+
+    # -- open a saved log -------------------------------------------------
+
+    def _open_log(self):
+        if self.rec.recording:
+            self._log("warn", "Stop the current test before opening a log")
+            return
+        path = filedialog.askopenfilename(
+            parent=self, initialdir=LOG_DIR, title="Open drain log",
+            filetypes=[("VoltCheck drain logs", "*.csv"), ("All files", "*.*")])
+        if path:
+            self._load_log(path)
+
+    def _load_log(self, path: str):
+        """Load a drain CSV for review — e.g. the partial log left behind when
+        the machine died mid-test. Replays analysis so drops/stalls are
+        refound, shows it on the graph, and enables report generation."""
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            samples = [Sample(
+                ts=float(r["timestamp"]), percent=int(r["percent"]),
+                remaining_mwh=int(r["remaining_mwh"] or 0),
+                rate_mw=int(r["rate_mw"] or 0),
+                voltage_mv=int(r["voltage_mv"] or 0),
+                plugged=r["plugged"] == "1",
+                charging=r["charging"] == "1") for r in rows]
+        except Exception as e:
+            self._log("fault", f"Could not read {os.path.basename(path)}: {e}")
+            return
+        if not samples:
+            self._log("warn", f"{os.path.basename(path)} has no samples")
+            return
+
+        self.rec.samples = samples          # replace wholesale (not recording)
+        self.rec.events.clear()
+        self._loaded_csv = path
+        self._view_samples = self.rec.samples
+        self.ax.set_title(f"Saved log — {os.path.basename(path)}",
+                          color=TEXT_DIM, fontsize=10, loc="left")
+
+        saved_last = self.last_sample       # replay without corrupting live state
+        self.last_sample = None
+        self.charge_stall_since = 0
+        for s in samples:
+            self._analyze(s)
+            self.last_sample = s
+        self.last_sample = saved_last
+        self.charge_stall_since = 0
+
+        faults = sum(1 for e in self.rec.events if e.level == "fault")
+        dur = samples[-1].ts - samples[0].ts
+        self._log("fault" if faults else "ok",
+                  f"Loaded {os.path.basename(path)}: {len(samples)} samples, "
+                  f"{fmt_dur(dur)}, {samples[0].percent}%→{samples[-1].percent}%, "
+                  f"{faults} fault(s) — GENERATE REPORT for a full write-up, "
+                  f"or START to continue the test")
+        self._refresh_graph()
 
     def _toggle_sim(self):
         if self.sim.active:
@@ -1192,7 +1302,7 @@ class App(ctk.CTk):
                        f"({drop}%), avg {avg_w:.1f} W, {len(ss)} samples, "
                        f"{faults} fault(s). CSV: {os.path.basename(self.rec.csv_path)}")
 
-    def _gen_report(self):
+    def _gen_report(self, open_browser: bool = True):
         if self._report_busy:
             return
         if not self.rec.samples:
@@ -1204,8 +1314,9 @@ class App(ctk.CTk):
             try:
                 path = generate_report(self.rec, self.static, self.demo)
                 self._ui_queue.put(lambda: self._log("ok", f"Report saved: {path}"))
-                self._ui_queue.put(lambda: webbrowser.open(
-                    f"file:///{path.replace(os.sep, '/')}"))
+                if open_browser:
+                    self._ui_queue.put(lambda: webbrowser.open(
+                        f"file:///{path.replace(os.sep, '/')}"))
             except Exception as e:
                 self._ui_queue.put(lambda: self._log("fault", f"Report failed: {e}"))
             finally:
