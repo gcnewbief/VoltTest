@@ -39,7 +39,7 @@ from matplotlib.figure import Figure
 # ---------------------------------------------------------------- constants
 
 APP_NAME = "VoltCheck"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 GITHUB_REPO = "gcnewbief/VoltTest"   # releases feed for the update check
 SAMPLE_MS = 2000               # poll interval
 GRAPH_MAX_POINTS = 5400        # ~3h of data at 2s
@@ -755,18 +755,28 @@ class App(ctk.CTk):
         block.pack(fill="x")
 
         side_canvas = getattr(inner, "_parent_canvas", None)
+        side_vsb = getattr(inner, "_scrollbar", None)
         if side_canvas is None:
             # customtkinter internals changed - fill the panel and always scroll
             inner.grid_configure(row=0, rowspan=3, sticky="nsew")
+            self._fit_side = lambda: None
         else:
             def _fit_side(_=None):
                 # canvas is a raw tk widget - height is physical px
                 avail = max(0, side.winfo_height() - 4)
                 need = block.winfo_reqheight()
-                side_canvas.configure(height=max(60, min(need, avail)))
+                if need > avail:          # overflow: fill, show scrollbar
+                    if side_vsb is not None:
+                        side_vsb.grid()
+                    side_canvas.configure(height=max(60, avail))
+                else:                     # fits: shrink to content, centre, no scrollbar
+                    if side_vsb is not None:
+                        side_vsb.grid_remove()
+                    side_canvas.configure(height=max(60, need))
             side.bind("<Configure>", lambda e: _fit_side())
             block.bind("<Configure>", lambda e: _fit_side())
             self.after(150, _fit_side)
+            self._fit_side = _fit_side   # re-fit each _tick; heals stale measurements
 
         self.pct_lbl = self._mk_label(block, "–%", ("Consolas", 34, "bold"), GREEN, pady=(4, 0))
         self.state_lbl = self._mk_label(block, "Detecting…", ("Segoe UI", 14), TEXT_DIM)
@@ -1108,6 +1118,7 @@ class App(ctk.CTk):
         dt = max(now - self.last_ts, 0.1) if self.last_ts else SAMPLE_MS / 1000
         self.last_ts = now
         self.clock_lbl.configure(text=datetime.now().strftime("%H:%M:%S"))
+        self._fit_side()
 
         r = self.demo_batt.read(dt) if self.demo_batt else _read_power_status()
         if not self.demo_batt:
