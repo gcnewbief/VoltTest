@@ -39,7 +39,7 @@ from matplotlib.figure import Figure
 # ---------------------------------------------------------------- constants
 
 APP_NAME = "VoltCheck"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.0"
 GITHUB_REPO = "gcnewbief/VoltTest"   # releases feed for the update check
 SAMPLE_MS = 2000               # poll interval
 GRAPH_MAX_POINTS = 5400        # ~3h of data at 2s
@@ -310,22 +310,44 @@ class DemoBattery:
         self.capacity = 48000
         self.remaining = float(self.capacity)
         self.dropped = False
+        # second simulated pack so dual-battery UI paths can be exercised
+        self.capacity2 = 32000
+        self.remaining2 = float(self.capacity2)
+        self.dropped2 = False
+        self.pack_pcts: tuple = ()
 
     def static(self) -> StaticInfo:
         return StaticInfo(name="DemoCell X1", manufacturer="VoltCheck Sim",
                           serial="SIM-0001", chemistry="Li-ion",
                           design_mwh=56000, full_charge_mwh=48000,
-                          cycle_count="312")
+                          cycle_count="312",
+                          batteries=[
+                              {"name": "DemoCell X1", "manufacturer": "VoltCheck Sim",
+                               "serial": "SIM-0001", "chemistry": "Li-ion",
+                               "design_mwh": 56000, "full_charge_mwh": 48000,
+                               "cycle_count": "312"},
+                              {"name": "DemoCell S2", "manufacturer": "VoltCheck Sim",
+                               "serial": "SIM-0002", "chemistry": "Li-ion",
+                               "design_mwh": 36000, "full_charge_mwh": 32000,
+                               "cycle_count": "410"},
+                          ])
 
     def read(self, dt: float) -> LiveReading:
         dt *= self.SPEED
         rate = -(15000 + 4000 * math.sin(time.time() / 30) + random.uniform(-1500, 1500))
         self.remaining += rate * dt / 3600  # mWh over dt
+        self.remaining2 += rate * 1.18 * dt / 3600  # pack 2 drains a little harder
         pct = self.remaining / self.capacity * 100
         if not self.dropped and pct < 65:
             self.remaining -= self.capacity * 0.06       # sudden 6% drop
             self.dropped = True
+        pct2 = self.remaining2 / self.capacity2 * 100
+        if not self.dropped2 and pct2 < 50:
+            self.remaining2 -= self.capacity2 * 0.05     # pack 2 stumbles at 50%
+            self.dropped2 = True
         pct = max(0.0, self.remaining / self.capacity * 100)
+        pct2 = max(0.0, self.remaining2 / self.capacity2 * 100)
+        self.pack_pcts = (int(round(pct)), int(round(pct2)))
         return LiveReading(present=True, plugged=False, discharging=True,
                            percent=int(round(pct)),
                            remaining_mwh=int(self.remaining),
@@ -398,6 +420,7 @@ class Sample:
     voltage_mv: int
     plugged: bool
     charging: bool
+    pack_pcts: tuple = ()          # per-pack % (dual-battery systems)
 
 
 @dataclass
@@ -432,7 +455,7 @@ class Recorder:
         self._csv_writer = csv.writer(self._csv_file)
         self._csv_writer.writerow(
             ["timestamp", "iso_time", "percent", "remaining_mwh",
-             "rate_mw", "voltage_mv", "plugged", "charging"])
+             "rate_mw", "voltage_mv", "plugged", "charging", "pack_pcts"])
         for s in self.samples:
             self._write_row(s)
 
@@ -447,7 +470,8 @@ class Recorder:
         self._csv_writer.writerow(
             [f"{s.ts:.3f}", datetime.fromtimestamp(s.ts).isoformat(timespec="seconds"),
              s.percent, s.remaining_mwh, s.rate_mw, s.voltage_mv,
-             int(s.plugged), int(s.charging)])
+             int(s.plugged), int(s.charging),
+             "|".join(str(p) for p in s.pack_pcts)])
         self._csv_file.flush()
 
     def add(self, s: Sample):
@@ -485,8 +509,21 @@ def _svg_chart(samples: list[Sample], w=920, h=260) -> str:
         ts = t0 + span * i / 4
         parts.append(f'<text x="{x(ts):.1f}" y="{h-8}" fill="{TEXT_DIM}" font-size="10" '
                      f'text-anchor="middle">{datetime.fromtimestamp(ts):%H:%M}</text>')
-    pts = " ".join(f"{x(s.ts):.1f},{yp(s.percent):.1f}" for s in samples)
-    parts.append(f'<polyline points="{pts}" fill="none" stroke="{GREEN}" stroke-width="1.8"/>')
+    # charge % line - or one line per pack on dual-battery machines
+    dual = any(s.pack_pcts for s in samples)
+    if dual:
+        for j, (col, lbl) in enumerate(((GREEN, "B1"), (TEAL, "B2"))):
+            pts = " ".join(f"{x(s.ts):.1f},{yp(s.pack_pcts[j]):.1f}"
+                           for s in samples
+                           if len(s.pack_pcts) > j and s.pack_pcts[j] >= 0)
+            parts.append(f'<polyline points="{pts}" fill="none" stroke="{col}" '
+                         f'stroke-width="1.8"/>')
+            parts.append(f'<text x="{pad_l+10}" y="{pad_t+12+j*14}" fill="{col}" '
+                         f'font-size="10">&#8212; {lbl}</text>')
+    else:
+        pts = " ".join(f"{x(s.ts):.1f},{yp(s.percent):.1f}" for s in samples)
+        parts.append(f'<polyline points="{pts}" fill="none" stroke="{GREEN}" '
+                     f'stroke-width="1.8"/>')
     # power line coloured by direction: blue discharging, orange charging.
     # consecutive same-sign samples are grouped so a polyline never bridges
     # a direction flip (a zero-rate sample continues the current run, and
@@ -652,6 +689,7 @@ class App(ctk.CTk):
         self._report_busy = False
         self._voltages: list[int] = []
         self._wmi_packs: list = []
+        self._wmi_fcc: list[int] = []
         self._drain_unlocked = False
         self._saved_power: dict = {}
         self._awake_unlocked = False
@@ -726,6 +764,7 @@ class App(ctk.CTk):
         self.state_lbl = self._mk_label(block, "Detecting…", ("Segoe UI", 14), TEXT_DIM)
         self.rate_lbl = self._mk_label(block, "", ("Consolas", 16, "bold"), BLUE, pady=(4, 0))
         self.eta_lbl = self._mk_label(block, "", ("Segoe UI", 12), TEXT_DIM, pady=(0, 2))
+        self.pack_lbl = self._mk_label(block, "", ("Segoe UI", 11), TEAL)
         ctk.CTkFrame(block, fg_color=BORDER, height=1).pack(fill="x", padx=14, pady=(2, 0))
 
         btn = ctk.CTkFrame(block, fg_color="transparent")
@@ -800,6 +839,13 @@ class App(ctk.CTk):
                         ["discharging", "charging"], loc="upper right",
                         fontsize=7, facecolor=PANEL_ALT, edgecolor=BORDER,
                         labelcolor=TEXT_DIM)
+        (self.line_b1,) = self.ax.plot([], [], color=GREEN, lw=1.6)
+        (self.line_b2,) = self.ax.plot([], [], color=TEAL, lw=1.6)
+        self.legend_batt = self.ax.legend(
+            [self.line_b1, self.line_b2], ["B1", "B2"], loc="lower left",
+            fontsize=7, facecolor=PANEL_ALT, edgecolor=BORDER,
+            labelcolor=TEXT_DIM)
+        self.legend_batt.set_visible(False)
         self.anom_scatter = self.ax.scatter([], [], color=RED, s=18, zorder=5)
         self.trans_scatter = self.ax2.scatter([], [], color=TEXT, s=14, zorder=5)
         self.canvas = FigureCanvasTkAgg(self.fig, master=graphf)
@@ -909,14 +955,24 @@ class App(ctk.CTk):
         while True:
             try:
                 out = _run_ps(
-                    "Get-CimInstance -Namespace root/wmi -ClassName BatteryStatus"
-                    " -ErrorAction SilentlyContinue | Select-Object Voltage,"
-                    "ChargeRate,DischargeRate,RemainingCapacity,Discharging,"
-                    "Charging,PowerOnline | ConvertTo-Json -Compress")
+                    "$bs = @(Get-CimInstance -Namespace root/wmi -ClassName"
+                    " BatteryStatus -ErrorAction SilentlyContinue | Select-Object"
+                    " Voltage,ChargeRate,DischargeRate,RemainingCapacity,"
+                    "Discharging,Charging,PowerOnline);"
+                    "$fc = @(Get-CimInstance -Namespace root/wmi -ClassName"
+                    " BatteryFullChargedCapacity -ErrorAction SilentlyContinue"
+                    " | ForEach-Object { $_.FullChargedCapacity });"
+                    "[pscustomobject]@{ packs = $bs; fcc = $fc }"
+                    " | ConvertTo-Json -Compress")
                 data = json.loads(out) if out.strip() else None
                 if data:
-                    packs = data if isinstance(data, list) else [data]
-                    self._wmi_packs = packs
+                    packs = data.get("packs") or []
+                    self._wmi_packs = packs if isinstance(packs, list) else [packs]
+                    fcc = data.get("fcc") or []
+                    fcc = fcc if isinstance(fcc, list) else [fcc]
+                    self._wmi_fcc = [int(x) for x in fcc
+                                     if isinstance(x, (int, float)) and x > 0]
+                    packs = self._wmi_packs
                     volts = [b["Voltage"] for b in packs
                              if isinstance(b.get("Voltage"), int) and b["Voltage"] > 0]
                     if volts:
@@ -1057,6 +1113,15 @@ class App(ctk.CTk):
             r.voltage_mv = self._voltages[0]
         s = Sample(now, r.percent, r.remaining_mwh, r.rate_mw, r.voltage_mv,
                    r.plugged, r.charging)
+        if self.demo_batt:
+            s.pack_pcts = self.demo_batt.pack_pcts
+        elif len(self._wmi_packs) == 2 and len(self._wmi_fcc) == 2:
+            pp = []
+            for i in range(2):
+                fcc = self._wmi_fcc[i]
+                rem = self._wmi_packs[i].get("RemainingCapacity") or 0
+                pp.append(min(100, int(rem * 100 / fcc)) if rem else -1)
+            s.pack_pcts = tuple(pp)
         if s.rate_mw == 0:
             s.rate_mw = self._derive_rate(s)   # firmware gave no rate -> measure it
         self._analyze(s)
@@ -1135,6 +1200,9 @@ class App(ctk.CTk):
             self.eta_lbl.configure(text=f"~{fmt_dur(r.est_secs)} remaining")
         else:
             self.eta_lbl.configure(text="")
+        if s.pack_pcts:
+            self.pack_lbl.configure(text="  ·  ".join(
+                f"B{i+1} {p}%" for i, p in enumerate(s.pack_pcts) if p >= 0))
         if s.remaining_mwh:
             self.cap_rem.configure(text=f"{s.remaining_mwh:,} mWh")
         fcc = self.static.full_charge_mwh or r.full_charge_mwh
@@ -1150,7 +1218,20 @@ class App(ctk.CTk):
         ss = samples[::step]
         t0 = ss[0].ts
         x = [(s.ts - t0) / 60 for s in ss]
-        self.line_pct.set_data(x, [s.percent for s in ss])
+        # dual-battery machines: the left axis swaps the aggregate % line
+        # for one line per pack (B1 green / B2 teal) with a legend
+        if any(s.pack_pcts for s in ss):
+            self.line_pct.set_data([], [])
+            for j, line in enumerate((self.line_b1, self.line_b2)):
+                line.set_data(x, [s.pack_pcts[j] if len(s.pack_pcts) > j
+                                  and s.pack_pcts[j] >= 0 else None
+                                  for s in ss])
+            self.legend_batt.set_visible(True)
+        else:
+            self.line_pct.set_data(x, [s.percent for s in ss])
+            self.line_b1.set_data([], [])
+            self.line_b2.set_data([], [])
+            self.legend_batt.set_visible(False)
         # split power by direction (blue discharge / orange charge). Each
         # sample inherits the previous sign when the rate reads 0, and the
         # boundary sample is shared between both series so the line stays
@@ -1369,7 +1450,10 @@ class App(ctk.CTk):
                 rate_mw=int(r["rate_mw"] or 0),
                 voltage_mv=int(r["voltage_mv"] or 0),
                 plugged=r["plugged"] == "1",
-                charging=r["charging"] == "1") for r in rows]
+                charging=r["charging"] == "1",
+                pack_pcts=tuple(int(v) for v in (r.get("pack_pcts") or "")
+                                .split("|") if v.strip("-").isdigit()))
+                for r in rows]
         except Exception as e:
             self._log("fault", f"Could not read {os.path.basename(path)}: {e}")
             return
