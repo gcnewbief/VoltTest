@@ -19,6 +19,7 @@ import os
 import queue
 import random
 import re
+import ssl
 import subprocess
 import sys
 import threading
@@ -39,7 +40,7 @@ from matplotlib.figure import Figure
 # ---------------------------------------------------------------- constants
 
 APP_NAME = "VoltCheck"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 GITHUB_REPO = "gcnewbief/VoltTest"   # releases feed for the update check
 SAMPLE_MS = 2000               # poll interval
 GRAPH_MAX_POINTS = 5400        # ~3h of data at 2s
@@ -1091,7 +1092,16 @@ class App(ctk.CTk):
                 f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
                 headers={"Accept": "application/vnd.github+json",
                          "User-Agent": f"{APP_NAME}/{APP_VERSION}"})
-            data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+            try:
+                data = json.loads(
+                    urllib.request.urlopen(req, timeout=10).read())
+            except ssl.SSLError:
+                # machine with stale/broken Windows root certs (old OS, AV
+                # TLS inspection) - retry against certifi's bundled CAs
+                import certifi
+                ctx = ssl.create_default_context(cafile=certifi.where())
+                data = json.loads(
+                    urllib.request.urlopen(req, timeout=10, context=ctx).read())
             ver = str(data.get("tag_name", "")).lstrip("vV")
             if ver and _ver_tuple(ver) > _ver_tuple(APP_VERSION):
                 url = data.get("html_url") or \
