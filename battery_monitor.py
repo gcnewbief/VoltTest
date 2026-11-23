@@ -40,7 +40,7 @@ from matplotlib.figure import Figure
 # ---------------------------------------------------------------- constants
 
 APP_NAME = "VoltCheck"
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.3.6"
 GITHUB_REPO = "gcnewbief/VoltTest"   # releases feed for the update check
 SAMPLE_MS = 2000               # poll interval
 GRAPH_MAX_POINTS = 5400        # ~3h of data at 2s
@@ -1412,21 +1412,28 @@ class App(ctk.CTk):
     #    test is never napped off. subgroup -> {setting: DC index}
     _PWR_AWAKE = {
         "238c9fa8-0aad-41ed-83f4-97be242c8f20": {   # SUB_SLEEP
-            "29f6c1db-86da-48c5-9fdb-f2b67b1f4980": 0,   # STANDBYIDLE -> never
+            "29f6c1db-86da-48c5-9fdb-f2b67b1f44da": 0,   # STANDBYIDLE -> never
             "9d7815a6-7ee4-497e-8888-515a05f02364": 0,   # HIBERNATEIDLE-> never
         },
         "7516b95f-f776-4464-8c53-06167f40cc99": {   # SUB_VIDEO
             "3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e": 0,   # VIDEOIDLE -> never
         },
     }
+    _PWR_NAMES = {
+        "29f6c1db-86da-48c5-9fdb-f2b67b1f44da": "sleep",
+        "9d7815a6-7ee4-497e-8888-515a05f02364": "hibernate",
+        "3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e": "display off",
+    }
 
-    def _powercfg(self, *args) -> int:
+    def _powercfg(self, *args):
+        """(ok, combined output)"""
         try:
-            return subprocess.run(
-                ["powercfg", *args], capture_output=True,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode
-        except Exception:
-            return -1
+            p = subprocess.run(
+                ["powercfg", *args], capture_output=True, text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            return p.returncode == 0, (p.stdout + p.stderr).strip()
+        except Exception as e:
+            return False, str(e)
 
     def _query_dc_settings(self, sub: str) -> dict:
         """Current DC indexes for one power subgroup, keyed by GUID."""
@@ -1447,59 +1454,88 @@ class App(ctk.CTk):
                 vals[cur] = int(m.group(1), 16)
         return vals
 
-    def _set_dc_plan(self, plan: dict) -> bool:
-        """Write DC indexes {subgroup: {guid: index}} and re-apply the scheme."""
-        ok = True
+    def _set_dc_plan(self, plan: dict):
+        """Write DC indexes {subgroup: {guid: index}} and re-apply the
+        scheme. Returns (ok, first_error_text)."""
+        err, ok = "", True
         for sub, items in plan.items():
             for guid, val in items.items():
-                ok &= self._powercfg("/setdcvalueindex", "SCHEME_CURRENT",
-                                     sub, guid, str(val)) == 0
-        return self._powercfg("/setactive", "SCHEME_CURRENT") == 0 and ok
+                good, out = self._powercfg("/setdcvalueindex", "SCHEME_CURRENT",
+                                           sub, guid, str(val))
+                if not good:
+                    ok = False
+                    err = err or (out.splitlines() or ["?"])[0]
+        good, out = self._powercfg("/setactive", "SCHEME_CURRENT")
+        if not good:
+            ok = False
+            err = err or (out.splitlines() or ["?"])[0]
+        return ok, err
 
     def _toggle_drain(self):
         if self._drain_unlocked:
-            ok = self._set_dc_plan({self._PWR_SUB: self._saved_power})
+            ok, err = self._set_dc_plan({self._PWR_SUB: self._saved_power})
             self._drain_unlocked = False
             self.drain_btn.configure(text="🔋  DRAIN TO EMPTY: OFF", text_color=ORANGE)
             self._log("ok" if ok else "warn",
                       "Windows battery actions restored" if ok else
-                      "Restore failed — check power settings manually")
+                      f"Restore failed ({err}) — check power settings manually")
             return
 
         self._saved_power = self._query_dc_settings(self._PWR_SUB)
-        ok = self._set_dc_plan({self._PWR_SUB: self._PWR_ITEMS})
+        plan = {g: v for g, v in self._PWR_ITEMS.items()
+                if g in self._saved_power}
+        if not plan:
+            self._log("fault", "No battery power settings found on this system")
+            return
+        ok, err = self._set_dc_plan({self._PWR_SUB: plan})
         if ok:
             self._drain_unlocked = True
             self.drain_btn.configure(text="🔋  DRAIN TO EMPTY: ON", text_color=GREEN)
             self._log("ok", "Low/critical battery actions disabled — will drain "
                             "to hardware cutoff (~0-3%). Re-enable after testing.")
         else:
-            self._log("fault", "Could not change power settings — run VoltCheck "
-                               "as Administrator to unlock deep drain")
+            self._log("fault", f"Could not change power settings: {err} "
+                               "(try running VoltCheck as Administrator)")
 
     def _toggle_awake(self):
         """KEEP AWAKE: stop Windows blanking the screen / sleeping /
         hibernating on battery so a long test is never napped off."""
         if self._awake_unlocked:
-            ok = self._set_dc_plan(self._saved_awake)
+            ok, err = self._set_dc_plan(self._saved_awake)
             self._awake_unlocked = False
             self.awake_btn.configure(text="💤  KEEP AWAKE: OFF", text_color=ORANGE)
             self._log("ok" if ok else "warn",
                       "Sleep/display settings restored" if ok else
-                      "Restore failed — check power settings manually")
+                      f"Restore failed ({err}) — check power settings manually")
             return
 
+        # save current values, then write only the settings this system
+        # actually has - Modern Standby machines may not expose hibernate
+        # or sleep-idle at all
         self._saved_awake = {sub: self._query_dc_settings(sub)
                              for sub in self._PWR_AWAKE}
-        ok = self._set_dc_plan(self._PWR_AWAKE)
+        plan, skipped = {}, []
+        for sub, items in self._PWR_AWAKE.items():
+            have = self._saved_awake.get(sub, {})
+            write = {g: v for g, v in items.items() if g in have}
+            if write:
+                plan[sub] = write
+            skipped += [self._PWR_NAMES.get(g, g) for g in items if g not in have]
+        if not plan:
+            self._log("fault", "No sleep/display power settings found on this system")
+            return
+        ok, err = self._set_dc_plan(plan)
         if ok:
             self._awake_unlocked = True
             self.awake_btn.configure(text="💤  KEEP AWAKE: ON", text_color=GREEN)
-            self._log("ok", "Screen-off, sleep and hibernate disabled on battery "
-                            "— stays awake for the test. Restores on toggle-off/exit.")
+            msg = ("Screen-off, sleep and hibernate disabled on battery "
+                   "— stays awake for the test. Restores on toggle-off/exit.")
+            if skipped:
+                msg += " (not present, skipped: " + ", ".join(skipped) + ")"
+            self._log("ok", msg)
         else:
-            self._log("fault", "Could not change power settings — run VoltCheck "
-                               "as Administrator to keep it awake")
+            self._log("fault", f"Could not change power settings: {err} "
+                               "(try running VoltCheck as Administrator)")
 
     # -- open a saved log -------------------------------------------------
 
