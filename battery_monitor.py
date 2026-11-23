@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -38,7 +39,8 @@ from matplotlib.figure import Figure
 # ---------------------------------------------------------------- constants
 
 APP_NAME = "VoltCheck"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
+GITHUB_REPO = "gcnewbief/VoltTest"   # releases feed for the update check
 SAMPLE_MS = 2000               # poll interval
 GRAPH_MAX_POINTS = 5400        # ~3h of data at 2s
 
@@ -485,11 +487,29 @@ def _svg_chart(samples: list[Sample], w=920, h=260) -> str:
                      f'text-anchor="middle">{datetime.fromtimestamp(ts):%H:%M}</text>')
     pts = " ".join(f"{x(s.ts):.1f},{yp(s.percent):.1f}" for s in samples)
     parts.append(f'<polyline points="{pts}" fill="none" stroke="{GREEN}" stroke-width="1.8"/>')
-    rpts = " ".join(f"{x(s.ts):.1f},{yr(abs(s.rate_mw)):.1f}" for s in samples)
-    parts.append(f'<polyline points="{rpts}" fill="none" stroke="{BLUE}" '
-                 f'stroke-width="1" opacity="0.6"/>')
-    parts.append(f'<text x="{w-pad_r+6}" y="{pad_t+10}" fill="{BLUE}" '
-                 f'font-size="10">{rmax//1000}W</text>')
+    # power line coloured by direction: blue discharging, orange charging.
+    # consecutive same-sign samples are grouped so a polyline never bridges
+    # a direction flip (a zero-rate sample continues the current run).
+    runs, run, sgn, prev = [], [], -1, None
+    for s in samples:
+        g = 1 if s.rate_mw > 0 else (-1 if s.rate_mw < 0 else sgn)
+        if g != sgn and run:
+            runs.append((sgn, run))
+            run = [prev] if prev else []
+        sgn = g
+        run.append(s)
+        prev = s
+    if run:
+        runs.append((sgn, run))
+    for g, rs in runs:
+        rpts = " ".join(f"{x(s.ts):.1f},{yr(abs(s.rate_mw)):.1f}" for s in rs)
+        parts.append(f'<polyline points="{rpts}" fill="none" '
+                     f'stroke="{ORANGE if g > 0 else BLUE}" '
+                     f'stroke-width="1" opacity="0.6"/>')
+    parts.append(f'<text x="{w-pad_r-6}" y="{pad_t+12}" fill="{BLUE}" font-size="10" '
+                 f'text-anchor="end">&#8212; discharge ({rmax//1000}W max)</text>')
+    parts.append(f'<text x="{w-pad_r-6}" y="{pad_t+26}" fill="{ORANGE}" font-size="10" '
+                 f'text-anchor="end">&#8212; charge</text>')
     parts.append('</svg>')
     return "".join(parts)
 
@@ -596,6 +616,11 @@ def fmt_dur(secs: float) -> str:
     return f"{secs//3600}:{secs%3600//60:02d}:{secs%60:02d}"
 
 
+def _ver_tuple(s: str) -> tuple:
+    """'v1.2.0' -> (1, 2, 0) for release-tag comparison."""
+    return tuple(int(x) for x in re.findall(r"\d+", s)[:3])
+
+
 class App(ctk.CTk):
     def __init__(self, demo: bool = False):
         super().__init__()
@@ -631,6 +656,7 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._log("info", f"{APP_NAME} started" + (" [DEMO MODE]" if demo else ""))
         threading.Thread(target=self._load_static, daemon=True).start()
+        threading.Thread(target=self._check_update, daemon=True).start()
         if not self.demo_batt:
             threading.Thread(target=self._poll_wmi, daemon=True).start()
         self.after(300, self._tick)
@@ -647,6 +673,9 @@ class App(ctk.CTk):
         top.grid_propagate(False)
         ctk.CTkLabel(top, text=f"⚡ VOLTCHECK  v{APP_VERSION}", text_color=GREEN,
                      font=("Consolas", 20, "bold")).pack(side="left", padx=16)
+        self.update_lbl = ctk.CTkLabel(top, text="", text_color=ORANGE,
+                                       font=("Consolas", 12, "bold"), cursor="hand2")
+        self.update_lbl.pack(side="left")
         self.rec_lbl = ctk.CTkLabel(top, text="● IDLE", text_color=TEXT_DIM,
                                     font=("Consolas", 14, "bold"))
         self.rec_lbl.pack(side="right", padx=16)
@@ -667,31 +696,16 @@ class App(ctk.CTk):
         side.grid_rowconfigure(0, weight=1)
         side.grid_columnconfigure(0, weight=1)
 
-        # stats scroll if the window is too short; buttons stay pinned
-        inner = ctk.CTkScrollableFrame(side, fg_color="transparent",
-                                       scrollbar_button_color=BORDER,
-                                       scrollbar_button_hover_color=GREEN_DIM)
+        # live stats at the top of the side panel; health/capacity details
+        # live in the info tile strip below the graph so they're never
+        # hidden behind scrolling
+        inner = ctk.CTkFrame(side, fg_color="transparent")
         inner.grid(row=0, column=0, sticky="nsew")
 
         self.pct_lbl = self._mk_label(inner, "–%", ("Consolas", 44, "bold"), GREEN, pady=(10, 0))
         self.state_lbl = self._mk_label(inner, "Detecting…", ("Segoe UI", 14), TEXT_DIM)
         self.rate_lbl = self._mk_label(inner, "", ("Consolas", 16, "bold"), BLUE, pady=(4, 0))
         self.eta_lbl = self._mk_label(inner, "", ("Segoe UI", 12), TEXT_DIM, pady=(0, 8))
-
-        self._sep(inner)
-        self._mk_label(inner, "BATTERY HEALTH", ("Segoe UI", 10, "bold"), TEXT_DIM)
-        self.health_bar = ctk.CTkProgressBar(inner, fg_color=PANEL_ALT,
-                                           progress_color=GREEN, height=14)
-        self.health_bar.pack(fill="x", padx=18, pady=(6, 2))
-        self.health_bar.set(0)
-        self.health_lbl = self._mk_label(inner, "–", ("Consolas", 16, "bold"), GREEN)
-        self.batt_info = self._mk_label(inner, "", ("Segoe UI", 11), TEXT_DIM, pady=(2, 0))
-        self.cycle_lbl = self._mk_label(inner, "", ("Segoe UI", 11), TEXT_DIM)
-        self._sep(inner)
-        self._mk_label(inner, "CAPACITY", ("Segoe UI", 10, "bold"), TEXT_DIM)
-        self.cap_rem = self._stat(inner, "Remaining")
-        self.cap_fcc = self._stat(inner, "Full charge")
-        self.cap_des = self._stat(inner, "Design")
 
         btn = ctk.CTkFrame(side, fg_color="transparent")
         btn.grid(row=1, column=0, sticky="ew", padx=14, pady=8)
@@ -755,14 +769,62 @@ class App(ctk.CTk):
         self.fig.tight_layout(pad=1.2)
         (self.line_pct,) = self.ax.plot([], [], color=GREEN, lw=1.6)
         (self.line_rate,) = self.ax2.plot([], [], color=BLUE, lw=0.9, alpha=0.65)
+        (self.line_chg,) = self.ax2.plot([], [], color=ORANGE, lw=0.9, alpha=0.75)
+        self.ax2.legend([self.line_rate, self.line_chg],
+                        ["discharging", "charging"], loc="upper right",
+                        fontsize=7, facecolor=PANEL_ALT, edgecolor=BORDER,
+                        labelcolor=TEXT_DIM)
         self.anom_scatter = self.ax.scatter([], [], color=RED, s=18, zorder=5)
         self.canvas = FigureCanvasTkAgg(self.fig, master=graphf)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
 
+        # info tile strip: battery health + capacity, always visible
+        strip = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=8,
+                             border_color=BORDER, border_width=1)
+        strip.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 8))
+        for c in range(5):
+            strip.grid_columnconfigure(c, weight=1, uniform="tiles")
+
+        def tile(col, title):
+            f = ctk.CTkFrame(strip, fg_color=PANEL_ALT, corner_radius=6)
+            f.grid(row=0, column=col, sticky="nsew", padx=5, pady=6)
+            ctk.CTkLabel(f, text=title, font=("Segoe UI", 9, "bold"),
+                         text_color=TEXT_DIM).pack(anchor="w", padx=10, pady=(5, 0))
+            return f
+
+        def vtile(col, title):
+            v = ctk.CTkLabel(tile(col, title), text="–",
+                             font=("Consolas", 13, "bold"), text_color=TEXT,
+                             justify="left")
+            v.pack(anchor="w", padx=10, pady=(2, 8))
+            return v
+
+        tf = tile(0, "BATTERY HEALTH")
+        self.health_lbl = ctk.CTkLabel(tf, text="–",
+                                       font=("Consolas", 16, "bold"), text_color=GREEN)
+        self.health_lbl.pack(anchor="w", padx=10)
+        self.health_bar = ctk.CTkProgressBar(tf, fg_color=PANEL,
+                                             progress_color=GREEN, height=9)
+        self.health_bar.pack(fill="x", padx=10, pady=(2, 7))
+        self.health_bar.set(0)
+
+        tf = tile(1, "BATTERY")
+        self.batt_info = ctk.CTkLabel(tf, text="", font=("Segoe UI", 10),
+                                      text_color=TEXT, wraplength=150, justify="left")
+        self.batt_info.pack(anchor="w", padx=10)
+        self.cycle_lbl = ctk.CTkLabel(tf, text="", font=("Segoe UI", 9),
+                                      text_color=TEXT_DIM, wraplength=150,
+                                      justify="left")
+        self.cycle_lbl.pack(anchor="w", padx=10, pady=(0, 6))
+
+        self.cap_rem = vtile(2, "REMAINING")
+        self.cap_fcc = vtile(3, "FULL CHARGE")
+        self.cap_des = vtile(4, "DESIGN")
+
         # event log
         logf = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=8,
                             border_color=BORDER, border_width=1, height=110)
-        logf.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+        logf.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
         logf.grid_propagate(False)
         self.log_box = ctk.CTkTextbox(logf, fg_color=PANEL_ALT, text_color=TEXT,
                                       font=("Consolas", 11), corner_radius=6)
@@ -777,19 +839,6 @@ class App(ctk.CTk):
         l = ctk.CTkLabel(parent, text=text, font=font, text_color=color)
         l.pack(pady=pady)
         return l
-
-    def _stat(self, parent, label):
-        f = ctk.CTkFrame(parent, fg_color="transparent")
-        f.pack(fill="x", padx=18, pady=1)
-        ctk.CTkLabel(f, text=label, font=("Segoe UI", 11),
-                     text_color=TEXT_DIM).pack(side="left")
-        v = ctk.CTkLabel(f, text="–", font=("Consolas", 12, "bold"),
-                         text_color=TEXT)
-        v.pack(side="right")
-        return v
-
-    def _sep(self, parent):
-        ctk.CTkFrame(parent, fg_color=BORDER, height=1).pack(fill="x", padx=14, pady=6)
 
     # ---------------- logging / events
 
@@ -907,6 +956,31 @@ class App(ctk.CTk):
         else:
             self.cycle_lbl.configure(
                 text=f"Cycles: {st.cycle_count}   S/N: {st.serial or '-'}")
+
+    # ---------------- update check
+
+    def _check_update(self):
+        """One-shot GitHub releases check. Stays quiet on any failure
+        (offline, rate-limited, no releases) - it's a nicety, not vital."""
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                headers={"Accept": "application/vnd.github+json",
+                         "User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+            data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+            ver = str(data.get("tag_name", "")).lstrip("vV")
+            if ver and _ver_tuple(ver) > _ver_tuple(APP_VERSION):
+                url = data.get("html_url") or \
+                    f"https://github.com/{GITHUB_REPO}/releases"
+                self._ui_queue.put(lambda: self._show_update(ver, url))
+        except Exception:
+            pass
+
+    def _show_update(self, ver: str, url: str):
+        self.update_lbl.configure(text=f"⬇ v{ver} available")
+        self.update_lbl.bind("<Button-1>", lambda e: webbrowser.open(url))
+        self._log("info", f"Update available: v{ver} (running v{APP_VERSION}) — "
+                          "click ⬇ in the title bar to download")
 
     # ---------------- polling loop
 
@@ -1028,7 +1102,12 @@ class App(ctk.CTk):
         t0 = ss[0].ts
         x = [(s.ts - t0) / 60 for s in ss]
         self.line_pct.set_data(x, [s.percent for s in ss])
-        self.line_rate.set_data(x, [abs(s.rate_mw) / 1000 for s in ss])
+        # split power by direction so charge and discharge read differently;
+        # None breaks the line instead of bridging across the flip
+        self.line_rate.set_data(
+            x, [-s.rate_mw / 1000 if s.rate_mw < 0 else None for s in ss])
+        self.line_chg.set_data(
+            x, [s.rate_mw / 1000 if s.rate_mw > 0 else None for s in ss])
         drops_x, drops_y = [], []  # mark samples right after a big drop
         for i in range(1, len(ss)):
             if (ss[i - 1].percent - ss[i].percent >= DROP_FAULT_PCT
