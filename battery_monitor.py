@@ -39,7 +39,7 @@ from matplotlib.figure import Figure
 # ---------------------------------------------------------------- constants
 
 APP_NAME = "VoltCheck"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 GITHUB_REPO = "gcnewbief/VoltTest"   # releases feed for the update check
 SAMPLE_MS = 2000               # poll interval
 GRAPH_MAX_POINTS = 5400        # ~3h of data at 2s
@@ -489,13 +489,16 @@ def _svg_chart(samples: list[Sample], w=920, h=260) -> str:
     parts.append(f'<polyline points="{pts}" fill="none" stroke="{GREEN}" stroke-width="1.8"/>')
     # power line coloured by direction: blue discharging, orange charging.
     # consecutive same-sign samples are grouped so a polyline never bridges
-    # a direction flip (a zero-rate sample continues the current run).
-    runs, run, sgn, prev = [], [], -1, None
+    # a direction flip (a zero-rate sample continues the current run, and
+    # each new run starts on the previous sample so the line is unbroken);
+    # flips get a dot like the live graph's transition markers
+    runs, run, sgn, prev, flips = [], [], -1, None, []
     for s in samples:
         g = 1 if s.rate_mw > 0 else (-1 if s.rate_mw < 0 else sgn)
         if g != sgn and run:
             runs.append((sgn, run))
             run = [prev] if prev else []
+            flips.append(s)
         sgn = g
         run.append(s)
         prev = s
@@ -506,6 +509,9 @@ def _svg_chart(samples: list[Sample], w=920, h=260) -> str:
         parts.append(f'<polyline points="{rpts}" fill="none" '
                      f'stroke="{ORANGE if g > 0 else BLUE}" '
                      f'stroke-width="1" opacity="0.6"/>')
+    for s in flips:
+        parts.append(f'<circle cx="{x(s.ts):.1f}" cy="{yr(abs(s.rate_mw)):.1f}" '
+                     f'r="3" fill="{TEXT}"/>')
     parts.append(f'<text x="{w-pad_r-6}" y="{pad_t+12}" fill="{BLUE}" font-size="10" '
                  f'text-anchor="end">&#8212; discharge ({rmax//1000}W max)</text>')
     parts.append(f'<text x="{w-pad_r-6}" y="{pad_t+26}" fill="{ORANGE}" font-size="10" '
@@ -630,7 +636,7 @@ class App(ctk.CTk):
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.wm_geometry(f"{min(1180, sw - 60)}x{min(980, sh - 70)}+20+20")
-        self.minsize(900, 560)
+        self.minsize(900, 760)
 
         self.demo = demo
         self.rec = Recorder()
@@ -648,6 +654,8 @@ class App(ctk.CTk):
         self._wmi_packs: list = []
         self._drain_unlocked = False
         self._saved_power: dict = {}
+        self._awake_unlocked = False
+        self._saved_awake: dict = {}
         self._ui_queue: queue.Queue = queue.Queue()  # threads -> main thread
         self.sim = LoadSim()
         self._yt_url = self._load_cfg()
@@ -696,57 +704,67 @@ class App(ctk.CTk):
         side.grid_rowconfigure(0, weight=1)
         side.grid_columnconfigure(0, weight=1)
 
-        # live stats at the top of the side panel; health/capacity details
-        # live in the info tile strip below the graph so they're never
-        # hidden behind scrolling
+        # live stats + buttons as one block, centred vertically: the
+        # weighted empty rows above and below split the spare room
         inner = ctk.CTkFrame(side, fg_color="transparent")
-        inner.grid(row=0, column=0, sticky="nsew")
+        inner.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        inner.grid_rowconfigure(0, weight=1)
+        inner.grid_rowconfigure(2, weight=1)
+        inner.grid_columnconfigure(0, weight=1)
+        block = ctk.CTkFrame(inner, fg_color="transparent")
+        block.grid(row=1, column=0, sticky="nsew")
 
-        self.pct_lbl = self._mk_label(inner, "–%", ("Consolas", 44, "bold"), GREEN, pady=(10, 0))
-        self.state_lbl = self._mk_label(inner, "Detecting…", ("Segoe UI", 14), TEXT_DIM)
-        self.rate_lbl = self._mk_label(inner, "", ("Consolas", 16, "bold"), BLUE, pady=(4, 0))
-        self.eta_lbl = self._mk_label(inner, "", ("Segoe UI", 12), TEXT_DIM, pady=(0, 8))
+        self.pct_lbl = self._mk_label(block, "–%", ("Consolas", 34, "bold"), GREEN, pady=(4, 0))
+        self.state_lbl = self._mk_label(block, "Detecting…", ("Segoe UI", 14), TEXT_DIM)
+        self.rate_lbl = self._mk_label(block, "", ("Consolas", 16, "bold"), BLUE, pady=(4, 0))
+        self.eta_lbl = self._mk_label(block, "", ("Segoe UI", 12), TEXT_DIM, pady=(0, 2))
+        ctk.CTkFrame(block, fg_color=BORDER, height=1).pack(fill="x", padx=14, pady=(2, 0))
 
-        btn = ctk.CTkFrame(side, fg_color="transparent")
-        btn.grid(row=1, column=0, sticky="ew", padx=14, pady=8)
+        btn = ctk.CTkFrame(block, fg_color="transparent")
+        btn.pack(fill="x", padx=14, pady=(6, 0))
         self.test_btn = ctk.CTkButton(
             btn, text="▶  START DRAIN TEST", fg_color=GREEN_DIM, hover_color="#2e7d32",
             text_color="#eaffea", font=("Segoe UI", 13, "bold"),
             command=self._toggle_test)
-        self.test_btn.pack(fill="x", pady=3)
+        self.test_btn.pack(fill="x", pady=1)
         self.cancel_btn = ctk.CTkButton(
             btn, text="✕  CANCEL (discard)", fg_color="#3a1a1a", hover_color="#5a2626",
             text_color="#ff8a80", font=("Segoe UI", 12, "bold"),
             command=self._cancel_test, state="disabled")
-        self.cancel_btn.pack(fill="x", pady=3)
+        self.cancel_btn.pack(fill="x", pady=1)
         self.drain_btn = ctk.CTkButton(
             btn, text="🔋  DRAIN TO EMPTY: OFF", fg_color="#1a2b1a",
             hover_color="#274427", text_color=ORANGE,
             font=("Segoe UI", 12, "bold"), command=self._toggle_drain)
-        self.drain_btn.pack(fill="x", pady=3)
+        self.drain_btn.pack(fill="x", pady=1)
+        self.awake_btn = ctk.CTkButton(
+            btn, text="💤  KEEP AWAKE: OFF", fg_color="#1a2b1a",
+            hover_color="#274427", text_color=ORANGE,
+            font=("Segoe UI", 12, "bold"), command=self._toggle_awake)
+        self.awake_btn.pack(fill="x", pady=1)
         self.sim_btn = ctk.CTkButton(
             btn, text="👤  USER SIM: OFF", fg_color="#1a2b1a",
             hover_color="#274427", text_color=TEAL,
             font=("Segoe UI", 12, "bold"), command=self._toggle_sim)
-        self.sim_btn.pack(fill="x", pady=3)
+        self.sim_btn.pack(fill="x", pady=1)
         self.yt_btn = ctk.CTkButton(
             btn, text="📺  YT VIDEO TEST", fg_color="#1a2b1a",
             hover_color="#274427", text_color=TEAL,
             font=("Segoe UI", 12, "bold"), command=self._yt_test)
-        self.yt_btn.pack(fill="x", pady=3)
+        self.yt_btn.pack(fill="x", pady=1)
         self.yt_btn.bind("<Button-3>", lambda e: self._yt_url_prompt())
         ctk.CTkButton(btn, text="�  OPEN LOG", fg_color="#1a2b1a",
                       hover_color="#274427", text_color=TEAL,
                       font=("Segoe UI", 12, "bold"),
-                      command=self._open_log).pack(fill="x", pady=3)
+                      command=self._open_log).pack(fill="x", pady=1)
         ctk.CTkButton(btn, text="�📄  GENERATE REPORT", fg_color="#1a2b1a",
                       hover_color="#274427", text_color=TEAL,
                       font=("Segoe UI", 12, "bold"),
-                      command=self._gen_report).pack(fill="x", pady=3)
+                      command=self._gen_report).pack(fill="x", pady=1)
         ctk.CTkButton(btn, text="🪟  WINDOWS REPORT", fg_color="#1a2b1a",
                       hover_color="#274427", text_color=TEXT_DIM,
                       font=("Segoe UI", 12, "bold"),
-                      command=self._windows_report).pack(fill="x", pady=3)
+                      command=self._windows_report).pack(fill="x", pady=1)
 
         # graph
         graphf = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=8,
@@ -775,6 +793,7 @@ class App(ctk.CTk):
                         fontsize=7, facecolor=PANEL_ALT, edgecolor=BORDER,
                         labelcolor=TEXT_DIM)
         self.anom_scatter = self.ax.scatter([], [], color=RED, s=18, zorder=5)
+        self.trans_scatter = self.ax2.scatter([], [], color=TEXT, s=14, zorder=5)
         self.canvas = FigureCanvasTkAgg(self.fig, master=graphf)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
 
@@ -1102,12 +1121,28 @@ class App(ctk.CTk):
         t0 = ss[0].ts
         x = [(s.ts - t0) / 60 for s in ss]
         self.line_pct.set_data(x, [s.percent for s in ss])
-        # split power by direction so charge and discharge read differently;
-        # None breaks the line instead of bridging across the flip
-        self.line_rate.set_data(
-            x, [-s.rate_mw / 1000 if s.rate_mw < 0 else None for s in ss])
-        self.line_chg.set_data(
-            x, [s.rate_mw / 1000 if s.rate_mw > 0 else None for s in ss])
+        # split power by direction (blue discharge / orange charge). Each
+        # sample inherits the previous sign when the rate reads 0, and the
+        # boundary sample is shared between both series so the line stays
+        # continuous across a flip - flips get a dot instead of a gap
+        n = len(ss)
+        eff, sgn = [], -1
+        for s in ss:
+            if s.rate_mw > 0:
+                sgn = 1
+            elif s.rate_mw < 0:
+                sgn = -1
+            eff.append(sgn)
+        w = [abs(s.rate_mw) / 1000 for s in ss]
+        dis = [w[i] if eff[i] < 0 else None for i in range(n)]
+        chg = [w[i] if eff[i] > 0 else None for i in range(n)]
+        flips = [i for i in range(1, n) if eff[i] != eff[i - 1]]
+        for i in flips:
+            dis[i], chg[i - 1] = w[i], w[i - 1]
+        self.line_rate.set_data(x, dis)
+        self.line_chg.set_data(x, chg)
+        self.trans_scatter.set_offsets(
+            [(x[i], w[i]) for i in flips] if flips else [[0, -10]])
         drops_x, drops_y = [], []  # mark samples right after a big drop
         for i in range(1, len(ss)):
             if (ss[i - 1].percent - ss[i].percent >= DROP_FAULT_PCT
@@ -1186,6 +1221,18 @@ class App(ctk.CTk):
         "637ea02f-bbcb-4015-8e2c-a1c7b9c0b546": 0,   # BATACTIONCRIT-> do nothing
     }
 
+    # -- "keep awake": DC display-off / sleep / hibernate -> never, so a long
+    #    test is never napped off. subgroup -> {setting: DC index}
+    _PWR_AWAKE = {
+        "238c9fa8-0aad-41ed-83f4-97be242c8f20": {   # SUB_SLEEP
+            "29f6c1db-86da-48c5-9fdb-f2b67b1f4980": 0,   # STANDBYIDLE -> never
+            "9d7815a6-7ee4-497e-8888-515a05f02364": 0,   # HIBERNATEIDLE-> never
+        },
+        "7516b95f-f776-4464-8c53-06167f40cc99": {   # SUB_VIDEO
+            "3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e": 0,   # VIDEOIDLE -> never
+        },
+    }
+
     def _powercfg(self, *args) -> int:
         try:
             return subprocess.run(
@@ -1194,11 +1241,11 @@ class App(ctk.CTk):
         except Exception:
             return -1
 
-    def _query_dc_settings(self) -> dict:
-        """Current DC indexes for the battery subgroup, keyed by GUID."""
+    def _query_dc_settings(self, sub: str) -> dict:
+        """Current DC indexes for one power subgroup, keyed by GUID."""
         try:
             out = subprocess.run(
-                ["powercfg", "/query", "SCHEME_CURRENT", self._PWR_SUB],
+                ["powercfg", "/query", "SCHEME_CURRENT", sub],
                 capture_output=True, text=True,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
         except Exception:
@@ -1213,13 +1260,18 @@ class App(ctk.CTk):
                 vals[cur] = int(m.group(1), 16)
         return vals
 
+    def _set_dc_plan(self, plan: dict) -> bool:
+        """Write DC indexes {subgroup: {guid: index}} and re-apply the scheme."""
+        ok = True
+        for sub, items in plan.items():
+            for guid, val in items.items():
+                ok &= self._powercfg("/setdcvalueindex", "SCHEME_CURRENT",
+                                     sub, guid, str(val)) == 0
+        return self._powercfg("/setactive", "SCHEME_CURRENT") == 0 and ok
+
     def _toggle_drain(self):
         if self._drain_unlocked:
-            ok = True
-            for guid, val in self._saved_power.items():
-                ok &= self._powercfg("/setdcvalueindex", "SCHEME_CURRENT",
-                                     self._PWR_SUB, guid, str(val)) == 0
-            ok &= self._powercfg("/setactive", "SCHEME_CURRENT") == 0
+            ok = self._set_dc_plan({self._PWR_SUB: self._saved_power})
             self._drain_unlocked = False
             self.drain_btn.configure(text="🔋  DRAIN TO EMPTY: OFF", text_color=ORANGE)
             self._log("ok" if ok else "warn",
@@ -1227,11 +1279,8 @@ class App(ctk.CTk):
                       "Restore failed — check power settings manually")
             return
 
-        self._saved_power = self._query_dc_settings()
-        ok = all(self._powercfg("/setdcvalueindex", "SCHEME_CURRENT",
-                                self._PWR_SUB, guid, str(val)) == 0
-                 for guid, val in self._PWR_ITEMS.items())
-        ok &= self._powercfg("/setactive", "SCHEME_CURRENT") == 0
+        self._saved_power = self._query_dc_settings(self._PWR_SUB)
+        ok = self._set_dc_plan({self._PWR_SUB: self._PWR_ITEMS})
         if ok:
             self._drain_unlocked = True
             self.drain_btn.configure(text="🔋  DRAIN TO EMPTY: ON", text_color=GREEN)
@@ -1240,6 +1289,30 @@ class App(ctk.CTk):
         else:
             self._log("fault", "Could not change power settings — run VoltCheck "
                                "as Administrator to unlock deep drain")
+
+    def _toggle_awake(self):
+        """KEEP AWAKE: stop Windows blanking the screen / sleeping /
+        hibernating on battery so a long test is never napped off."""
+        if self._awake_unlocked:
+            ok = self._set_dc_plan(self._saved_awake)
+            self._awake_unlocked = False
+            self.awake_btn.configure(text="💤  KEEP AWAKE: OFF", text_color=ORANGE)
+            self._log("ok" if ok else "warn",
+                      "Sleep/display settings restored" if ok else
+                      "Restore failed — check power settings manually")
+            return
+
+        self._saved_awake = {sub: self._query_dc_settings(sub)
+                             for sub in self._PWR_AWAKE}
+        ok = self._set_dc_plan(self._PWR_AWAKE)
+        if ok:
+            self._awake_unlocked = True
+            self.awake_btn.configure(text="💤  KEEP AWAKE: ON", text_color=GREEN)
+            self._log("ok", "Screen-off, sleep and hibernate disabled on battery "
+                            "— stays awake for the test. Restores on toggle-off/exit.")
+        else:
+            self._log("fault", "Could not change power settings — run VoltCheck "
+                               "as Administrator to keep it awake")
 
     # -- open a saved log -------------------------------------------------
 
@@ -1364,6 +1437,8 @@ class App(ctk.CTk):
         self.sim.stop()
         if self._drain_unlocked:
             self._toggle_drain()          # restore power settings on exit
+        if self._awake_unlocked:
+            self._toggle_awake()          # restore sleep/display on exit
         self.destroy()
 
     def _summarize(self):
