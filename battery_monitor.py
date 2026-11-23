@@ -1122,6 +1122,12 @@ class App(ctk.CTk):
                         urllib.request.urlopen(req, timeout=10,
                                                context=ctx).read())
                     break
+                except urllib.error.URLError as e:
+                    # urllib wraps TLS failures in URLError - only fall
+                    # through to the next context when the reason is SSL
+                    if not isinstance(getattr(e, "reason", None), ssl.SSLError):
+                        raise
+                    last_err = e
                 except ssl.SSLError as e:
                     last_err = e
             if data is None:
