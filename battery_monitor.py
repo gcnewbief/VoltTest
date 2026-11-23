@@ -39,7 +39,7 @@ from matplotlib.figure import Figure
 # ---------------------------------------------------------------- constants
 
 APP_NAME = "VoltCheck"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 GITHUB_REPO = "gcnewbief/VoltTest"   # releases feed for the update check
 SAMPLE_MS = 2000               # poll interval
 GRAPH_MAX_POINTS = 5400        # ~3h of data at 2s
@@ -739,26 +739,34 @@ class App(ctk.CTk):
                             border_color=BORDER, border_width=1)
         side.grid(row=0, column=0, sticky="ns", padx=(10, 5), pady=10)
         side.grid_propagate(False)
-        side.grid_rowconfigure(0, weight=1)
+        side.grid_rowconfigure(0, weight=1)   # spacer above
+        side.grid_rowconfigure(2, weight=1)   # spacer below
         side.grid_columnconfigure(0, weight=1)
 
-        # live stats + buttons as one block. It sits centred while there's
-        # room (_centre_block pads it); when the panel is too short - small
-        # window or 150%+ DPI scaling - it top-aligns and scrolls instead
+        # live stats + buttons as one block. The scrollable sits between two
+        # weighted spacer rows: while the block fits, the viewport is shrunk
+        # to the content so it centres and never scrolls; only when the panel
+        # is too short - small window or high DPI - does it fill and scroll.
         inner = ctk.CTkScrollableFrame(side, fg_color="transparent",
                                        scrollbar_button_color=BORDER,
                                        scrollbar_button_hover_color=GREEN_DIM)
-        inner.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        inner.grid(row=1, column=0, sticky="nsew")
         block = ctk.CTkFrame(inner, fg_color="transparent")
         block.pack(fill="x")
 
-        def _centre_block(_=None):
-            # winfo is in physical px but pack pady gets widget-scaling applied
-            sc = ctk.ScalingTracker.get_widget_scaling(block) or 1
-            pad = (side.winfo_height() - block.winfo_reqheight()) / 2 / sc
-            block.pack_configure(pady=(max(0, int(pad)), 0))
-        side.bind("<Configure>", lambda e: _centre_block())
-        self.after(150, _centre_block)
+        side_canvas = getattr(inner, "_parent_canvas", None)
+        if side_canvas is None:
+            # customtkinter internals changed - fill the panel and always scroll
+            inner.grid_configure(row=0, rowspan=3, sticky="nsew")
+        else:
+            def _fit_side(_=None):
+                # canvas is a raw tk widget - height is physical px
+                avail = max(0, side.winfo_height() - 4)
+                need = block.winfo_reqheight()
+                side_canvas.configure(height=max(60, min(need, avail)))
+            side.bind("<Configure>", lambda e: _fit_side())
+            block.bind("<Configure>", lambda e: _fit_side())
+            self.after(150, _fit_side)
 
         self.pct_lbl = self._mk_label(block, "–%", ("Consolas", 34, "bold"), GREEN, pady=(4, 0))
         self.state_lbl = self._mk_label(block, "Detecting…", ("Segoe UI", 14), TEXT_DIM)
@@ -1078,8 +1086,9 @@ class App(ctk.CTk):
                 url = data.get("html_url") or \
                     f"https://github.com/{GITHUB_REPO}/releases"
                 self._ui_queue.put(lambda: self._show_update(ver, url))
-        except Exception:
-            pass
+        except Exception as e:
+            self._ui_queue.put(lambda e=e: self._log(
+                "dim", f"Update check failed: {e}"))
 
     def _show_update(self, ver: str, url: str):
         self.update_lbl.configure(text=f"⬇ v{ver} available")
