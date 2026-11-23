@@ -40,7 +40,7 @@ from matplotlib.figure import Figure
 # ---------------------------------------------------------------- constants
 
 APP_NAME = "VoltCheck"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 GITHUB_REPO = "gcnewbief/VoltTest"   # releases feed for the update check
 SAMPLE_MS = 2000               # poll interval
 GRAPH_MAX_POINTS = 5400        # ~3h of data at 2s
@@ -785,7 +785,12 @@ class App(ctk.CTk):
         self.rate_lbl = self._mk_label(block, "", ("Consolas", 16, "bold"), BLUE, pady=(4, 0))
         self.eta_lbl = self._mk_label(block, "", ("Segoe UI", 12), TEXT_DIM, pady=(0, 2))
         self.pack_lbl = self._mk_label(block, "", ("Segoe UI", 11), TEAL)
-        ctk.CTkFrame(block, fg_color=BORDER, height=1).pack(fill="x", padx=14, pady=(2, 0))
+        # empty CTkLabels still request full height -> unpack them so they
+        # don't leave dead space between the stats and the buttons
+        self.eta_lbl.pack_forget()
+        self.pack_lbl.pack_forget()
+        self._side_sep = ctk.CTkFrame(block, fg_color=BORDER, height=1)
+        self._side_sep.pack(fill="x", padx=14, pady=(2, 0))
 
         btn = ctk.CTkFrame(block, fg_color="transparent")
         btn.pack(fill="x", padx=14, pady=(6, 0))
@@ -1238,6 +1243,17 @@ class App(ctk.CTk):
         if s.pack_pcts:
             self.pack_lbl.configure(text="  ·  ".join(
                 f"B{i+1} {p}%" for i, p in enumerate(s.pack_pcts) if p >= 0))
+        else:
+            self.pack_lbl.configure(text="")
+        # labels with no text leave dead space - only pack them when populated
+        if self.eta_lbl.cget("text"):
+            self.eta_lbl.pack(before=self._side_sep, pady=(0, 2))
+        else:
+            self.eta_lbl.pack_forget()
+        if self.pack_lbl.cget("text"):
+            self.pack_lbl.pack(before=self._side_sep)
+        else:
+            self.pack_lbl.pack_forget()
         if s.remaining_mwh:
             self.cap_rem.configure(text=f"{s.remaining_mwh:,} mWh")
         fcc = self.static.full_charge_mwh or r.full_charge_mwh
