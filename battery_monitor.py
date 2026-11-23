@@ -40,7 +40,7 @@ from matplotlib.figure import Figure
 # ---------------------------------------------------------------- constants
 
 APP_NAME = "VoltCheck"
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.3.5"
 GITHUB_REPO = "gcnewbief/VoltTest"   # releases feed for the update check
 SAMPLE_MS = 2000               # poll interval
 GRAPH_MAX_POINTS = 5400        # ~3h of data at 2s
@@ -1089,6 +1089,24 @@ class App(ctk.CTk):
 
     # ---------------- update check
 
+    @staticmethod
+    def _upd_ctxs():
+        """TLS contexts to try, best first. Machines with stale Windows
+        roots work via certifi; AV/proxy TLS inspection can send chains
+        that strict verification rejects - the last context still
+        verifies but without VERIFY_X509_STRICT."""
+        ctxs = [None]
+        try:
+            import certifi
+            ctxs.append(ssl.create_default_context(cafile=certifi.where()))
+        except ImportError:
+            pass
+        if hasattr(ssl, "VERIFY_X509_STRICT"):
+            lax = ssl.create_default_context()
+            lax.verify_flags &= ~ssl.VERIFY_X509_STRICT
+            ctxs.append(lax)
+        return ctxs
+
     def _check_update(self):
         """One-shot GitHub releases check. Stays quiet on any failure
         (offline, rate-limited, no releases) - it's a nicety, not vital."""
@@ -1097,16 +1115,17 @@ class App(ctk.CTk):
                 f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
                 headers={"Accept": "application/vnd.github+json",
                          "User-Agent": f"{APP_NAME}/{APP_VERSION}"})
-            try:
-                data = json.loads(
-                    urllib.request.urlopen(req, timeout=10).read())
-            except ssl.SSLError:
-                # machine with stale/broken Windows root certs (old OS, AV
-                # TLS inspection) - retry against certifi's bundled CAs
-                import certifi
-                ctx = ssl.create_default_context(cafile=certifi.where())
-                data = json.loads(
-                    urllib.request.urlopen(req, timeout=10, context=ctx).read())
+            data, last_err = None, None
+            for ctx in self._upd_ctxs():
+                try:
+                    data = json.loads(
+                        urllib.request.urlopen(req, timeout=10,
+                                               context=ctx).read())
+                    break
+                except ssl.SSLError as e:
+                    last_err = e
+            if data is None:
+                raise last_err
             ver = str(data.get("tag_name", "")).lstrip("vV")
             if ver and _ver_tuple(ver) > _ver_tuple(APP_VERSION):
                 url = data.get("html_url") or \
