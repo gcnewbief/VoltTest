@@ -1318,7 +1318,7 @@ class App(ctk.CTk):
                     self._ui_queue.put(lambda: webbrowser.open(
                         f"file:///{path.replace(os.sep, '/')}"))
             except Exception as e:
-                self._ui_queue.put(lambda: self._log("fault", f"Report failed: {e}"))
+                self._ui_queue.put(lambda e=e: self._log("fault", f"Report failed: {e}"))
             finally:
                 self._ui_queue.put(lambda: setattr(self, "_report_busy", False))
 
