@@ -39,7 +39,7 @@ from matplotlib.figure import Figure
 # ---------------------------------------------------------------- constants
 
 APP_NAME = "VoltCheck"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 GITHUB_REPO = "gcnewbief/VoltTest"   # releases feed for the update check
 SAMPLE_MS = 2000               # poll interval
 GRAPH_MAX_POINTS = 5400        # ~3h of data at 2s
@@ -704,15 +704,23 @@ class App(ctk.CTk):
         side.grid_rowconfigure(0, weight=1)
         side.grid_columnconfigure(0, weight=1)
 
-        # live stats + buttons as one block, centred vertically: the
-        # weighted empty rows above and below split the spare room
-        inner = ctk.CTkFrame(side, fg_color="transparent")
+        # live stats + buttons as one block. It sits centred while there's
+        # room (_centre_block pads it); when the panel is too short - small
+        # window or 150%+ DPI scaling - it top-aligns and scrolls instead
+        inner = ctk.CTkScrollableFrame(side, fg_color="transparent",
+                                       scrollbar_button_color=BORDER,
+                                       scrollbar_button_hover_color=GREEN_DIM)
         inner.grid(row=0, column=0, rowspan=2, sticky="nsew")
-        inner.grid_rowconfigure(0, weight=1)
-        inner.grid_rowconfigure(2, weight=1)
-        inner.grid_columnconfigure(0, weight=1)
         block = ctk.CTkFrame(inner, fg_color="transparent")
-        block.grid(row=1, column=0, sticky="nsew")
+        block.pack(fill="x")
+
+        def _centre_block(_=None):
+            # winfo is in physical px but pack pady gets widget-scaling applied
+            sc = ctk.ScalingTracker.get_widget_scaling(block) or 1
+            pad = (side.winfo_height() - block.winfo_reqheight()) / 2 / sc
+            block.pack_configure(pady=(max(0, int(pad)), 0))
+        side.bind("<Configure>", lambda e: _centre_block())
+        self.after(150, _centre_block)
 
         self.pct_lbl = self._mk_label(block, "–%", ("Consolas", 34, "bold"), GREEN, pady=(4, 0))
         self.state_lbl = self._mk_label(block, "Detecting…", ("Segoe UI", 14), TEXT_DIM)
@@ -797,28 +805,39 @@ class App(ctk.CTk):
         self.canvas = FigureCanvasTkAgg(self.fig, master=graphf)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
 
-        # info tile strip: battery health + capacity, always visible
+        # info tile strip: battery health + capacity, always visible. Tiles
+        # widen to fill the window but floor at TILE_W and scroll sideways
+        # past that - small windows / high-DPI never squish them
         strip = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=8,
                              border_color=BORDER, border_width=1)
         strip.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 8))
-        for c in range(5):
-            strip.grid_columnconfigure(c, weight=1, uniform="tiles")
+        tilesf = ctk.CTkScrollableFrame(strip, orientation="horizontal",
+                                        fg_color="transparent", height=100,
+                                        scrollbar_button_color=BORDER,
+                                        scrollbar_button_hover_color=GREEN_DIM)
+        tilesf.pack(fill="x")
 
-        def tile(col, title):
-            f = ctk.CTkFrame(strip, fg_color=PANEL_ALT, corner_radius=6)
-            f.grid(row=0, column=col, sticky="nsew", padx=5, pady=6)
+        TILE_W = 190
+        tile_frames = []
+
+        def tile(title):
+            f = ctk.CTkFrame(tilesf, fg_color=PANEL_ALT, corner_radius=6,
+                             width=TILE_W, height=94)
+            f.pack_propagate(False)
+            f.pack(side="left", fill="y", padx=5, pady=6)
+            tile_frames.append(f)
             ctk.CTkLabel(f, text=title, font=("Segoe UI", 9, "bold"),
                          text_color=TEXT_DIM).pack(anchor="w", padx=10, pady=(5, 0))
             return f
 
-        def vtile(col, title):
-            v = ctk.CTkLabel(tile(col, title), text="–",
+        def vtile(title):
+            v = ctk.CTkLabel(tile(title), text="–",
                              font=("Consolas", 13, "bold"), text_color=TEXT,
                              justify="left")
             v.pack(anchor="w", padx=10, pady=(2, 8))
             return v
 
-        tf = tile(0, "BATTERY HEALTH")
+        tf = tile("BATTERY HEALTH")
         self.health_lbl = ctk.CTkLabel(tf, text="–",
                                        font=("Consolas", 16, "bold"), text_color=GREEN)
         self.health_lbl.pack(anchor="w", padx=10)
@@ -827,18 +846,29 @@ class App(ctk.CTk):
         self.health_bar.pack(fill="x", padx=10, pady=(2, 7))
         self.health_bar.set(0)
 
-        tf = tile(1, "BATTERY")
+        tf = tile("BATTERY")
         self.batt_info = ctk.CTkLabel(tf, text="", font=("Segoe UI", 10),
-                                      text_color=TEXT, wraplength=150, justify="left")
+                                      text_color=TEXT, justify="left")
         self.batt_info.pack(anchor="w", padx=10)
         self.cycle_lbl = ctk.CTkLabel(tf, text="", font=("Segoe UI", 9),
-                                      text_color=TEXT_DIM, wraplength=150,
-                                      justify="left")
+                                      text_color=TEXT_DIM, justify="left")
         self.cycle_lbl.pack(anchor="w", padx=10, pady=(0, 6))
 
-        self.cap_rem = vtile(2, "REMAINING")
-        self.cap_fcc = vtile(3, "FULL CHARGE")
-        self.cap_des = vtile(4, "DESIGN")
+        self.cap_rem = vtile("REMAINING")
+        self.cap_fcc = vtile("FULL CHARGE")
+        self.cap_des = vtile("DESIGN")
+
+        def _fit_tiles(_=None):
+            # winfo is physical px; CTk widths are in unscaled units that get
+            # multiplied by widget scaling - convert so tiles fill or scroll
+            sc = ctk.ScalingTracker.get_widget_scaling(strip) or 1
+            w = max(TILE_W, int((strip.winfo_width() - 60) / 5 / sc))
+            for f in tile_frames:
+                f.configure(width=w)
+            self.batt_info.configure(wraplength=w - 20)
+            self.cycle_lbl.configure(wraplength=w - 20)
+        strip.bind("<Configure>", lambda e: _fit_tiles())
+        self.after(150, _fit_tiles)
 
         # event log
         logf = ctk.CTkFrame(body, fg_color=PANEL, corner_radius=8,
