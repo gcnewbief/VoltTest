@@ -687,6 +687,7 @@ class App(ctk.CTk):
         self.last_ts = 0.0
         self.charge_stall_since = 0.0
         self._report_busy = False
+        self._upd_retried = False
         self._voltages: list[int] = []
         self._wmi_packs: list = []
         self._wmi_fcc: list[int] = []
@@ -1099,6 +1100,10 @@ class App(ctk.CTk):
         except Exception as e:
             self._ui_queue.put(lambda e=e: self._log(
                 "dim", f"Update check failed: {e}"))
+            if not self._upd_retried:
+                # retry once in ~45s - network/VPN may not be up at app start
+                self._upd_retried = True
+                self._ui_queue.put(lambda: self.after(45_000, self._check_update))
 
     def _show_update(self, ver: str, url: str):
         self.update_lbl.configure(text=f"⬇ v{ver} available")
